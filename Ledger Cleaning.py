@@ -24,6 +24,18 @@ DEFAULT_COLUMNS = [
 REQUIRED_COLUMNS = {"Series", "Due Date", "Remarks", "Doc. No."}
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
+st.markdown(
+    """
+    <style>
+        div[data-testid="stToolbar"] { display: none !important; }
+        div[data-testid="stDecoration"] { display: none !important; }
+        div[data-testid="stStatusWidget"] { visibility: hidden !important; }
+        #MainMenu { visibility: hidden !important; }
+        footer { visibility: hidden !important; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
 def read_input(file_bytes: bytes, file_name: str) -> pd.DataFrame:
