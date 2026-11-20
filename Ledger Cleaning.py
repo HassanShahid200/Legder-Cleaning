@@ -1,4 +1,4 @@
-"""Streamlit web app to clean accounting exports with selectable, rearrangeable columns."""
+"""Streamlit web app to clean accounting exports with a desktop-style column selector."""
 
 import io
 from pathlib import Path
@@ -92,7 +92,6 @@ def build_excel_bytes(data: pd.DataFrame) -> bytes:
     buffer = io.BytesIO()
     safe_data.to_excel(buffer, index=False, engine="openpyxl")
 
-    # Reopen to verify the workbook is valid before offering it for download.
     buffer.seek(0)
     workbook = load_workbook(buffer, read_only=True, data_only=False)
     workbook.close()
@@ -103,15 +102,39 @@ def build_csv_bytes(data: pd.DataFrame) -> bytes:
     return data.to_csv(index=False).encode("utf-8-sig")
 
 
-def move_column(column_name: str, direction: int) -> None:
-    cols = list(st.session_state["selected_cols"])
-    if column_name not in cols:
+def add_columns(available_cols: list[str]) -> None:
+    to_add = [c for c in available_cols if st.session_state.get(f"avail_chk_{c}", False)]
+    if not to_add:
         return
-    idx = cols.index(column_name)
-    new_idx = idx + direction
-    if 0 <= new_idx < len(cols):
-        cols[idx], cols[new_idx] = cols[new_idx], cols[idx]
-        st.session_state["selected_cols"] = cols
+    st.session_state["selected_cols"] = st.session_state["selected_cols"] + to_add
+    for col in to_add:
+        st.session_state[f"avail_chk_{col}"] = False
+
+
+def remove_columns() -> None:
+    selected = st.session_state["selected_cols"]
+    to_remove = [c for c in selected if st.session_state.get(f"sel_chk_{c}", False)]
+    if not to_remove:
+        return
+    st.session_state["selected_cols"] = [c for c in selected if c not in to_remove]
+    for col in to_remove:
+        st.session_state[f"sel_chk_{col}"] = False
+
+
+def move_columns(direction: int) -> None:
+    cols = list(st.session_state["selected_cols"])
+    indices = [i for i, c in enumerate(cols) if st.session_state.get(f"sel_chk_{c}", False)]
+    if not indices:
+        return
+    if direction < 0 and indices[0] == 0:
+        return
+    if direction > 0 and indices[-1] == len(cols) - 1:
+        return
+
+    for index in (indices if direction < 0 else reversed(indices)):
+        value = cols.pop(index)
+        cols.insert(index + direction, value)
+    st.session_state["selected_cols"] = cols
 
 
 def main() -> None:
@@ -138,40 +161,71 @@ def main() -> None:
     all_columns = list(prepared.columns)
     file_id = f"{uploaded_file.name}_{uploaded_file.size}"
 
-    # Reset default column selection whenever a new file is uploaded.
+    # Reset selections and checkboxes when a new file is uploaded.
     if st.session_state.get("current_file_id") != file_id:
         st.session_state["current_file_id"] = file_id
         st.session_state["selected_cols"] = [
             c for c in DEFAULT_COLUMNS if c in all_columns
         ]
-
-    st.subheader("1. Select and Arrange Columns")
-    st.multiselect(
-        "Output columns (exported in the order shown below)",
-        options=all_columns,
-        key="selected_cols",
-    )
+        for key in list(st.session_state.keys()):
+            if key.startswith(("avail_chk_", "sel_chk_")):
+                del st.session_state[key]
 
     selected_cols = st.session_state["selected_cols"]
+    available_cols = [c for c in all_columns if c not in selected_cols]
+
+    st.subheader("1. Select and Arrange Columns")
+    st.caption("Check one or more columns, then use the center buttons to add, remove, or reorder them.")
+
+    left_col, mid_col, right_col = st.columns([4, 1.6, 4], gap="medium")
+
+    with left_col:
+        st.markdown("**Available columns**")
+        with st.container(height=340, border=True):
+            if not available_cols:
+                st.caption("All columns are selected.")
+            for col in available_cols:
+                st.checkbox(col, key=f"avail_chk_{col}")
+
+    with mid_col:
+        st.markdown("&nbsp;", unsafe_allow_html=True)
+        st.markdown("&nbsp;", unsafe_allow_html=True)
+        st.button(
+            "Add  →",
+            on_click=add_columns,
+            args=(available_cols,),
+            use_container_width=True,
+        )
+        st.button(
+            "←  Remove",
+            on_click=remove_columns,
+            use_container_width=True,
+        )
+        st.divider()
+        st.button(
+            "Move Up ↑",
+            on_click=move_columns,
+            args=(-1,),
+            use_container_width=True,
+        )
+        st.button(
+            "Move Down ↓",
+            on_click=move_columns,
+            args=(1,),
+            use_container_width=True,
+        )
+
+    with right_col:
+        st.markdown("**Selected columns (export order)**")
+        with st.container(height=340, border=True):
+            if not selected_cols:
+                st.caption("No columns selected.")
+            for idx, col in enumerate(selected_cols, start=1):
+                st.checkbox(f"{idx}. {col}", key=f"sel_chk_{col}")
+
     if not selected_cols:
         st.warning("Select at least one column to preview and export.")
         return
-
-    with st.expander("Reorder selected columns (Move Up / Move Down)"):
-        col_to_move = st.selectbox("Pick a column to move", options=selected_cols)
-        btn_col1, btn_col2, _ = st.columns([1, 1, 6])
-        btn_col1.button(
-            "Move Up",
-            on_click=move_column,
-            args=(col_to_move, -1),
-            use_container_width=True,
-        )
-        btn_col2.button(
-            "Move Down",
-            on_click=move_column,
-            args=(col_to_move, 1),
-            use_container_width=True,
-        )
 
     output = format_output(prepared.loc[:, selected_cols])
 
