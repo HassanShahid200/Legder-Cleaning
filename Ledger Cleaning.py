@@ -1,147 +1,211 @@
-import streamlit as st
+"""Streamlit web app to clean accounting exports with selectable, rearrangeable columns."""
+
+import io
+from pathlib import Path
+
 import pandas as pd
-import plotly.express as px
+import streamlit as st
+from openpyxl import load_workbook
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 
-# Set up the webpage for an Executive Dashboard feel
-st.set_page_config(page_title="Warehouse Analytics", page_icon="📦", layout="wide")
+APP_TITLE = "Accounting Data Cleaner"
+DEFAULT_COLUMNS = [
+    "Acct Code",
+    "Acct Name",
+    "Posting Date",
+    "Origin",
+    "Doc No",
+    "Remarks",
+    "Offset Acct",
+    "Offset Acct Name",
+    "Deb./Cred. (LC)",
+    "Balance Due (LC)",
+]
+REQUIRED_COLUMNS = {"Series", "Due Date", "Remarks", "Doc. No."}
 
-st.title("📦 Executive Warehouse Real-Time Dashboard")
-st.markdown("---")
+st.set_page_config(page_title=APP_TITLE, layout="wide")
 
-uploaded_file = st.file_uploader("Upload 'WareHouse Real time data.xlsx'", type=["xlsx"])
 
-if uploaded_file is not None:
+def read_input(file_bytes: bytes, file_name: str) -> pd.DataFrame:
+    extension = Path(file_name).suffix.lower()
+    buffer = io.BytesIO(file_bytes)
+    if extension == ".txt":
+        return pd.read_csv(buffer, sep="\t", encoding="utf-16", low_memory=False)
+    if extension == ".csv":
+        return pd.read_csv(buffer, low_memory=False)
+    if extension == ".xlsx":
+        return pd.read_excel(buffer, engine="openpyxl")
+    if extension == ".xls":
+        return pd.read_excel(buffer, engine="xlrd")
+    raise ValueError(f"Unsupported file format: {extension or 'unknown'}")
+
+
+def transform_data(data: pd.DataFrame) -> pd.DataFrame:
+    df = data.copy()
+    df.columns = df.columns.astype(str).str.strip()
+    missing = sorted(REQUIRED_COLUMNS - set(df.columns))
+    if missing:
+        raise ValueError("Missing required column(s): " + ", ".join(missing))
+
+    # Only a missing Series value identifies an account header row.
+    df["Acct Code"] = df["Due Date"].where(df["Series"].isna()).ffill()
+    df["Acct Name"] = df["Remarks"].where(df["Series"].isna()).ffill()
+    df = df.loc[~df["Series"].isna()].copy()
+
+    df[["Origin", "Doc No"]] = df["Doc. No."].str.split(n=1, expand=True)
+    ordered = [c for c in DEFAULT_COLUMNS if c in df.columns]
+    ordered += [c for c in df.columns if c not in ordered]
+    return df.reindex(columns=ordered)
+
+
+@st.cache_data(show_spinner="Reading and cleaning file...")
+def load_and_transform(file_bytes: bytes, file_name: str) -> pd.DataFrame:
+    raw = read_input(file_bytes, file_name)
+    return transform_data(raw)
+
+
+def format_output(data: pd.DataFrame) -> pd.DataFrame:
+    df = data.copy()
+    if "Posting Date" in df:
+        df["Posting Date"] = pd.to_datetime(
+            df["Posting Date"], format="%d.%m.%y", errors="coerce"
+        )
+    return df
+
+
+def clean_excel_text(data: pd.DataFrame) -> pd.DataFrame:
+    """Remove control characters that are invalid inside an Excel workbook."""
+    df = data.copy()
+    text_columns = df.select_dtypes(include=["object", "string"]).columns
+    for column in text_columns:
+        df[column] = df[column].map(
+            lambda value: ILLEGAL_CHARACTERS_RE.sub("", value)
+            if isinstance(value, str)
+            else value
+        )
+    return df
+
+
+def build_excel_bytes(data: pd.DataFrame) -> bytes:
+    """Create and validate an .xlsx file in memory."""
+    safe_data = clean_excel_text(data)
+    buffer = io.BytesIO()
+    safe_data.to_excel(buffer, index=False, engine="openpyxl")
+
+    # Reopen to verify the workbook is valid before offering it for download.
+    buffer.seek(0)
+    workbook = load_workbook(buffer, read_only=True, data_only=False)
+    workbook.close()
+    return buffer.getvalue()
+
+
+def build_csv_bytes(data: pd.DataFrame) -> bytes:
+    return data.to_csv(index=False).encode("utf-8-sig")
+
+
+def move_column(column_name: str, direction: int) -> None:
+    cols = list(st.session_state["selected_cols"])
+    if column_name not in cols:
+        return
+    idx = cols.index(column_name)
+    new_idx = idx + direction
+    if 0 <= new_idx < len(cols):
+        cols[idx], cols[new_idx] = cols[new_idx], cols[idx]
+        st.session_state["selected_cols"] = cols
+
+
+def main() -> None:
+    st.title(APP_TITLE)
+    st.caption(
+        "Upload a ledger export (.txt, .csv, .xlsx, .xls), choose and order your columns, "
+        "and download the cleaned file."
+    )
+
+    uploaded_file = st.file_uploader(
+        "Upload Input File",
+        type=["txt", "csv", "xlsx", "xls"],
+    )
+
+    if uploaded_file is None:
+        return
+
     try:
-        # 1. READ DATA
-        df_dispatch = pd.read_excel(uploaded_file, sheet_name='Dispatch')
-        df_received = pd.read_excel(uploaded_file, sheet_name='Recieved')
-        df_helper = pd.read_excel(uploaded_file, sheet_name='Helper Table')
-        
-        # 2. DATE FORMATTING
-        df_dispatch['Date'] = pd.to_datetime(df_dispatch['Dispatch Date'])
-        df_received['Date'] = pd.to_datetime(df_received['Posting Date'])
-        df_dispatch['Year'] = df_dispatch['Date'].dt.year.astype(str)
-        df_dispatch['Month'] = df_dispatch['Date'].dt.strftime('%b') 
-        df_received['Year'] = df_received['Date'].dt.year.astype(str)
-        df_received['Month'] = df_received['Date'].dt.strftime('%b')
+        prepared = load_and_transform(uploaded_file.getvalue(), uploaded_file.name)
+    except Exception as error:
+        st.error(f"Could not process the file: {error}")
+        return
 
-        # 3. BRIDGE TABLES
-        df_dispatch = pd.merge(df_dispatch, df_helper[['Customer Code', 'Customer Name']], left_on='CardCode', right_on='Customer Code', how='left')
-        df_dispatch['Customer Name'] = df_dispatch['Customer Name'].fillna(df_dispatch['CardName']) 
-        
-        df_received = pd.merge(df_received, df_helper[['Customer Name', 'Group']], left_on='Vendor Name', right_on='Customer Name', how='left')
-        df_received['Customer Name'] = df_received['Vendor Name']
+    all_columns = list(prepared.columns)
+    file_id = f"{uploaded_file.name}_{uploaded_file.size}"
 
-        # 4. DAX LOGIC TRANSLATION
-        def get_lp_divisor(cat):
-            cat = str(cat).strip()
-            if cat == "17 Layers": return 543
-            elif cat == "18 Layers": return 544.5
-            elif cat == "20 Layers": return 547.61
-            return 1
-            
-        def get_pallet_divisor(cat):
-            cat = str(cat).strip()
-            if cat == "17 Layers": return 9775
-            elif cat == "18 Layers": return 10350
-            elif cat == "20 Layers": return 11500
-            return 1
+    # Reset default column selection whenever a new file is uploaded.
+    if st.session_state.get("current_file_id") != file_id:
+        st.session_state["current_file_id"] = file_id
+        st.session_state["selected_cols"] = [
+            c for c in DEFAULT_COLUMNS if c in all_columns
+        ]
 
-        df_dispatch['Delivered Layer Pad'] = df_dispatch['Net Dispatch Qty'] / df_dispatch['Catgeory'].apply(get_lp_divisor)
-        df_dispatch['Delivered Pallets'] = df_dispatch['Net Dispatch Qty'] / df_dispatch['Catgeory'].apply(get_pallet_divisor)
-        df_dispatch['Delivered Top Frame'] = df_dispatch['Delivered Pallets']
+    st.subheader("1. Select and Arrange Columns")
+    st.multiselect(
+        "Output columns (exported in the order shown below)",
+        options=all_columns,
+        key="selected_cols",
+    )
 
-        # 5. POWER BI STYLE SLICERS
-        st.sidebar.image("https://cdn-icons-png.flaticon.com/512/2830/2830305.png", width=100)
-        st.sidebar.header("⚙️ Filter Panel")
-        st.sidebar.caption("💡 Leave a filter empty to select ALL")
-        
-        all_years = sorted(list(set(df_dispatch['Year'].dropna()) | set(df_received['Year'].dropna())))
-        all_months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-        avail_months = [m for m in all_months if m in set(df_dispatch['Month'].dropna()) | set(df_received['Month'].dropna())]
-        all_groups = sorted(list(set(df_dispatch['Group'].dropna()) | set(df_received['Group'].dropna())))
-        all_customers = sorted(list(set(df_dispatch['Customer Name'].dropna()) | set(df_received['Customer Name'].dropna())))
+    selected_cols = st.session_state["selected_cols"]
+    if not selected_cols:
+        st.warning("Select at least one column to preview and export.")
+        return
 
-        selected_years = st.sidebar.multiselect("📅 Select Year", all_years, default=all_years)
-        selected_months = st.sidebar.multiselect("📆 Select Month", avail_months, default=avail_months)
-        selected_groups = st.sidebar.multiselect("🏢 Select Group", all_groups, default=all_groups)
-        selected_customers = st.sidebar.multiselect("👤 Select Customer", all_customers, default=all_customers)
+    with st.expander("Reorder selected columns (Move Up / Move Down)"):
+        col_to_move = st.selectbox("Pick a column to move", options=selected_cols)
+        btn_col1, btn_col2, _ = st.columns([1, 1, 6])
+        btn_col1.button(
+            "Move Up",
+            on_click=move_column,
+            args=(col_to_move, -1),
+            use_container_width=True,
+        )
+        btn_col2.button(
+            "Move Down",
+            on_click=move_column,
+            args=(col_to_move, 1),
+            use_container_width=True,
+        )
 
-        # FIX: Power BI fallback logic! If empty, use ALL.
-        use_years = selected_years if selected_years else all_years
-        use_months = selected_months if selected_months else avail_months
-        use_groups = selected_groups if selected_groups else all_groups
-        use_customers = selected_customers if selected_customers else all_customers
+    output = format_output(prepared.loc[:, selected_cols])
 
-        # 6. APPLY FILTERS
-        mask_disp = (df_dispatch['Year'].isin(use_years)) & (df_dispatch['Month'].isin(use_months)) & (df_dispatch['Group'].isin(use_groups)) & (df_dispatch['Customer Name'].isin(use_customers))
-        filtered_dispatch = df_dispatch[mask_disp]
+    st.subheader("2. Preview Cleaned Data")
+    m1, m2 = st.columns(2)
+    m1.metric("Total Rows", f"{len(output):,}")
+    m2.metric("Selected Columns", len(output.columns))
+    st.dataframe(output.head(100), use_container_width=True)
 
-        mask_rec = (df_received['Year'].isin(use_years)) & (df_received['Month'].isin(use_months)) & (df_received['Group'].isin(use_groups)) & (df_received['Customer Name'].isin(use_customers))
-        filtered_received = df_received[mask_rec]
+    st.subheader("3. Export Cleaned File")
+    export_format = st.radio(
+        "Choose export format",
+        options=["Excel (.xlsx)", "CSV (.csv)"],
+        horizontal=True,
+    )
 
-        # 7. DAX AGGREGATIONS
-        del_lp_total = filtered_dispatch[filtered_dispatch['Group'] != "Mehran Bottlers (Pvt) Ltd."]['Delivered Layer Pad'].sum()
-        del_pallet_total = filtered_dispatch['Delivered Pallets'].sum()
-        del_tf_total = filtered_dispatch['Delivered Top Frame'].sum()
+    base_name = Path(uploaded_file.name).stem
+    if export_format == "Excel (.xlsx)":
+        file_data = build_excel_bytes(output)
+        file_name = f"{base_name}_cleaned.xlsx"
+        mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    else:
+        file_data = build_csv_bytes(output)
+        file_name = f"{base_name}_cleaned.csv"
+        mime = "text/csv"
 
-        rec_lp_total = filtered_received[filtered_received['Categ'].str.strip() == "Layer Pads"]['Net Quantity'].sum()
-        rec_pallet_total = filtered_received[filtered_received['Categ'].str.strip() == "Pallets"]['Net Quantity'].sum()
-        rec_tf_total = filtered_received[filtered_received['Categ'].str.strip() == "Top Frame"]['Net Quantity'].sum()
+    st.download_button(
+        label=f"Download {file_name}",
+        data=file_data,
+        file_name=file_name,
+        mime=mime,
+        type="primary",
+    )
 
-        # 8. TOP KPI CARDS
-        st.subheader("📊 Material Tracking Summary")
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            st.metric("Layer Pads (Delivered vs Received)", f"{del_lp_total:,.0f}", f"{rec_lp_total - del_lp_total:,.0f} Net diff")
-        with col2:
-            st.metric("Pallets (Delivered vs Received)", f"{del_pallet_total:,.0f}", f"{rec_pallet_total - del_pallet_total:,.0f} Net diff")
-        with col3:
-            st.metric("Top Frames (Delivered vs Received)", f"{del_tf_total:,.0f}", f"{rec_tf_total - del_tf_total:,.0f} Net diff")
 
-        st.markdown("---")
-
-        # 9. SEPARATE TABS FOR "WOW" FACTOR
-        tab1, tab2 = st.tabs(["📤 Delivered Tracking (by Customer)", "📥 Received Tracking (by Customer)"])
-
-        with tab1:
-            st.subheader("Deliveries Breakdown")
-            if not filtered_dispatch.empty:
-                del_cust = filtered_dispatch.groupby('Customer Name')[['Delivered Layer Pad', 'Delivered Pallets', 'Delivered Top Frame']].sum().reset_index()
-                
-                # Plotly Bar Chart
-                fig_del = px.bar(del_cust, x='Customer Name', y=['Delivered Layer Pad', 'Delivered Pallets', 'Delivered Top Frame'], 
-                                 barmode='group', title="Deliveries by Vendor/Customer")
-                st.plotly_chart(fig_del, use_container_width=True)
-                
-                # Interactive Table
-                st.dataframe(del_cust.style.format("{:,.1f}", subset=['Delivered Layer Pad', 'Delivered Pallets', 'Delivered Top Frame']), use_container_width=True)
-            else:
-                st.warning("No Delivery Data for the selected filters.")
-
-        with tab2:
-            st.subheader("Receiving Breakdown")
-            if not filtered_received.empty:
-                rec_cust = filtered_received.pivot_table(index='Customer Name', columns='Categ', values='Net Quantity', aggfunc='sum', fill_value=0).reset_index()
-                
-                # Ensure columns exist safely
-                for col in ['Layer Pads', 'Pallets', 'Top Frame']:
-                    if col not in rec_cust.columns:
-                        rec_cust[col] = 0
-                        
-                # Plotly Bar Chart
-                fig_rec = px.bar(rec_cust, x='Customer Name', y=['Layer Pads', 'Pallets', 'Top Frame'], 
-                                 barmode='group', title="Received Materials by Vendor/Customer",
-                                 color_discrete_sequence=['#2ecc71', '#27ae60', '#1abc9c'])
-                st.plotly_chart(fig_rec, use_container_width=True)
-                
-                # Interactive Table
-                st.dataframe(rec_cust.style.format("{:,.1f}", subset=['Layer Pads', 'Pallets', 'Top Frame']), use_container_width=True)
-            else:
-                st.warning("No Received Data for the selected filters.")
-
-    except Exception as e:
-        st.error(f"Error processing data: {e}")
-else:
-    st.info("👆 Please upload the Excel file to generate the dashboard.")
+if __name__ == "__main__":
+    main()
